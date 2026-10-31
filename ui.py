@@ -109,14 +109,26 @@ def groups_page(cid: int, rows, page: int, pages: int) -> K:
     return K(inline_keyboard=kb)
 
 
-def topics_kb(cid: int, chat_id: int, topics, picked) -> K:
-    kb = [
-        [B(text=("✅ " if t["id"] in picked else "▫️ ") + t["title"][:40],
-           callback_data=f"g:topic:{cid}:{chat_id}:{t['id']}")]
-        for t in topics
-    ]
-    kb.append([B(text="💾 Сохранить", callback_data=f"g:save:{cid}:{chat_id}")])
-    return K(inline_keyboard=kb)
+TOPIC_PAGE = 10
+
+
+def topics_kb(cid: int, chat_id: int, topics, picked, page: int, pages: int) -> K:
+    kb = []
+    for t in topics:
+        mark = "✅" if t["id"] in picked else "▫️"
+        kb.append([B(text=f"{mark} {t['title'][:35]}",
+                     callback_data=f"g:topic:{cid}:{chat_id}:{t['id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(B(text="⬅️", callback_data=f"g:tpage:{cid}:{chat_id}:{page - 1}"))
+    nav.append(B(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(B(text="➡️", callback_data=f"g:tpage:{cid}:{chat_id}:{page + 1}"))
+    kb.append(nav)
+
+    kb.append([B(text=f"💾 Сохранить ({len(picked)})", callback_data=f"g:save:{cid}:{chat_id}")])
+    return K(inline_keyboard=kb))
 
 
 def timing_kb(cid: int) -> K:
