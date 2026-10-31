@@ -119,6 +119,47 @@ def load_entities(raw: str):
             pass
     return res
 
+_FROM_TG = {
+    "bold": types.MessageEntityBold,
+    "italic": types.MessageEntityItalic,
+    "underline": types.MessageEntityUnderline,
+    "strikethrough": types.MessageEntityStrike,
+    "spoiler": types.MessageEntitySpoiler,
+    "code": types.MessageEntityCode,
+    "pre": types.MessageEntityPre,
+    "blockquote": types.MessageEntityBlockquote,
+    "text_link": types.MessageEntityTextUrl,
+    "url": types.MessageEntityUrl,
+    "email": types.MessageEntityEmail,
+    "phone_number": types.MessageEntityPhone,
+    "mention": types.MessageEntityMention,
+    "hashtag": types.MessageEntityHashtag,
+    "cashtag": types.MessageEntityCashtag,
+    "bot_command": types.MessageEntityBotCommand,
+    "text_mention": types.MessageEntityMentionName,
+    "custom_emoji": types.MessageEntityCustomEmoji,
+}
+
+
+def entities_from_tg(entities) -> str:
+    """aiogram MessageEntity -> json с классами Telethon."""
+    out = []
+    for e in entities or []:
+        kind = getattr(e, "type", None)
+        cls = _FROM_TG.get(kind)
+        if not cls:
+            continue
+        d = {"_": cls.__name__, "offset": e.offset, "length": e.length}
+        if kind == "text_link" and getattr(e, "url", None):
+            d["url"] = e.url
+        elif kind == "pre" and getattr(e, "language", None):
+            d["language"] = e.language
+        elif kind == "text_mention" and getattr(e, "user", None):
+            d["user_id"] = e.user.id
+        elif kind == "custom_emoji" and getattr(e, "custom_emoji_id", None):
+            d["document_id"] = int(e.custom_emoji_id)
+        out.append(d)
+    return json.dumps(out)
 
 def media_input(message):
     """InputMedia со свежим file_reference из сохранённого сообщения."""
