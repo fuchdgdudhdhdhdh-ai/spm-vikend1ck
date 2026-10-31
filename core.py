@@ -380,7 +380,7 @@ async def _send_inline(client, peer, msg, campaign, topic) -> bool:
 
 async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons) -> None:
     if msg["mode"] == "forward" and msg["saved_msg"]:
-        await client.forward_messages(peer, msg["saved_msg"], "me", reply_to=topic)
+        await client.forward_messages(peer, msg["saved_msg"], "me", reply_to=_reply(topic))
         return
 
     text = msg["text"] or ""
@@ -394,7 +394,7 @@ async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons
     media = media_input(source) if source else None
 
     if media is not None:
-        kwargs = {"caption": text or None, "formatting_entities": entities or None, "reply_to": topic}
+        kwargs = {"caption": text or None, "formatting_entities": entities or None, "reply_to": _reply(topic)}
         if buttons:
             kwargs["buttons"] = buttons
         if msg["is_document"]:
@@ -403,7 +403,7 @@ async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons
     else:
         kwargs = {
             "formatting_entities": entities or None,
-            "reply_to": topic,
+            "reply_to": _reply(topic),
             "link_preview": _preview(msg, campaign),
         }
         if buttons:
