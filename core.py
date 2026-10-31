@@ -94,31 +94,6 @@ async def shutdown_clients() -> None:
 
 _ENTITIES = {n: getattr(types, n) for n in dir(types) if n.startswith("MessageEntity")}
 
-
-def dump_entities(entities) -> str:
-    out = []
-    for e in entities or []:
-        d = {"_": type(e).__name__, "offset": e.offset, "length": e.length}
-        for f in ("url", "user_id", "document_id", "language"):
-            v = getattr(e, f, None)
-            if v is not None:
-                d[f] = v
-        out.append(d)
-    return json.dumps(out)
-
-
-def load_entities(raw: str):
-    res = []
-    for d in json.loads(raw or "[]"):
-        cls = _ENTITIES.get(d.get("_"))
-        if not cls:
-            continue
-        try:
-            res.append(cls(**{k: v for k, v in d.items() if k != "_"}))
-        except TypeError:
-            pass
-    return res
-
 _FROM_TG = {
     "bold": types.MessageEntityBold,
     "italic": types.MessageEntityItalic,
@@ -160,6 +135,20 @@ def entities_from_tg(entities) -> str:
             d["document_id"] = int(e.custom_emoji_id)
         out.append(d)
     return json.dumps(out)
+
+
+def load_entities(raw: str):
+    res = []
+    for d in json.loads(raw or "[]"):
+        cls = _ENTITIES.get(d.get("_"))
+        if not cls:
+            continue
+        try:
+            res.append(cls(**{k: v for k, v in d.items() if k != "_"}))
+        except TypeError:
+            pass
+    return res
+
 
 def media_input(message):
     """InputMedia со свежим file_reference из сохранённого сообщения."""
@@ -264,6 +253,7 @@ async def drop_media(client, chat_id: int | None, msg_id: int | None) -> None:
 
 _tasks: dict[int, asyncio.Task] = {}
 _session_fails: dict[int, int] = {}
+MAX_FAILS = 3
 
 SESSION_ERRORS = (
     AuthKeyUnregisteredError, AuthKeyDuplicatedError, SessionRevokedError,
@@ -286,7 +276,6 @@ def _is_fatal(e) -> bool:
         return True
     text = str(e).upper()
     return any(x in text for x in _FATAL_TEXT)
-MAX_FAILS = 3
 
 
 def is_running(cid: int) -> bool:
@@ -356,6 +345,7 @@ async def _peer(client, target):
 
 
 def _reply(topic):
+    """Нужен только для click() — хелперы send_message/send_file принимают int."""
     if not topic:
         return None
     return types.InputReplyToMessage(reply_to_msg_id=topic, top_msg_id=topic)
@@ -369,7 +359,10 @@ async def _send_inline(client, peer, msg, campaign, topic) -> bool:
         results = await client.inline_query(bot, f"{campaign['id']}_{msg['id']}")
         if not results:
             return False
-        await results[0].click(peer, reply_to=_reply(topic))
+        try:
+            await results[0].click(peer, reply_to=_reply(topic))
+        except TypeError:
+            await results[0].click(peer, reply_to=topic)
         return True
     except (FloodWaitError, SlowModeWaitError):
         raise
@@ -377,18 +370,10 @@ async def _send_inline(client, peer, msg, campaign, topic) -> bool:
         log.warning("inline %s: %r", bot, e)
         return False
 
-async def _call(make, topic):
-    """Пробует InputReplyTo, при TypeError откатывается на голый int."""
-    try:
-        return await make(_reply(topic))
-    except TypeError:
-        if not topic:
-            raise
-        return await make(topic)
 
 async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons) -> None:
     if msg["mode"] == "forward" and msg["saved_msg"]:
-        await _call(lambda rt: client.forward_messages(peer, msg["saved_msg"], "me", reply_to=rt), topic)
+        await client.forward_messages(peer, msg["saved_msg"], "me", reply_to=topic)
         return
 
     text = msg["text"] or ""
@@ -402,17 +387,22 @@ async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons
     media = media_input(source) if source else None
 
     if media is not None:
-        kwargs = {"caption": text or None, "formatting_entities": entities or None}
+        kwargs = {"caption": text or None, "formatting_entities": entities or None, "reply_to": topic}
         if buttons:
             kwargs["buttons"] = buttons
         if msg["is_document"]:
             kwargs["force_document"] = True
-        await _call(lambda rt: client.send_file(peer, media, reply_to=rt, **kwargs), topic)
+        await client.send_file(peer, media, **kwargs)
     else:
-        kwargs = {"formatting_entities": entities or None, "link_preview": _preview(msg, campaign)}
+        kwargs = {
+            "formatting_entities": entities or None,
+            "reply_to": topic,
+            "link_preview": _preview(msg, campaign),
+        }
         if buttons:
             kwargs["buttons"] = buttons
-        await _call(lambda rt: client.send_message(peer, text, reply_to=rt, **kwargs), topic)
+        await client.send_message(peer, text, **kwargs)
+
 
 async def _send(client, target, msg, campaign) -> None:
     entities = load_entities(msg["entities"])
@@ -440,6 +430,9 @@ async def _send(client, target, msg, campaign) -> None:
                 log.warning("чат %s закрыт для записи (%s), пропуск", target["chat_id"], type(e).__name__)
                 return
             except Exception as e:
+                if _is_fatal(e):
+                    log.warning("чат %s закрыт для записи (%s), пропуск", target["chat_id"], type(e).__name__)
+                    return
                 if _is_topic_closed(e):
                     if topic is not None:
                         log.warning("тема %s закрыта в %s → пишу в общий чат", topic, target["chat_id"])
