@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -36,9 +35,7 @@ async def main() -> None:
     if not cfg.bot_token or not cfg.api_id or not cfg.api_hash:
         raise SystemExit("Заполните BOT_TOKEN, TG_API_ID, TG_API_HASH")
 
-    Path(cfg.media_dir).mkdir(parents=True, exist_ok=True)
     await db.init()
-
     runner = await serve()
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
