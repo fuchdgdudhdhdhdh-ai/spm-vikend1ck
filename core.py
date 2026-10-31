@@ -377,10 +377,18 @@ async def _send_inline(client, peer, msg, campaign, topic) -> bool:
         log.warning("inline %s: %r", bot, e)
         return False
 
+async def _call(make, topic):
+    """Пробует InputReplyTo, при TypeError откатывается на голый int."""
+    try:
+        return await make(_reply(topic))
+    except TypeError:
+        if not topic:
+            raise
+        return await make(topic)
 
 async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons) -> None:
     if msg["mode"] == "forward" and msg["saved_msg"]:
-        await client.forward_messages(peer, msg["saved_msg"], "me", reply_to=_reply(topic))
+        await _call(lambda rt: client.forward_messages(peer, msg["saved_msg"], "me", reply_to=rt), topic)
         return
 
     text = msg["text"] or ""
@@ -394,22 +402,17 @@ async def _deliver(client, peer, target, msg, campaign, topic, entities, buttons
     media = media_input(source) if source else None
 
     if media is not None:
-        kwargs = {"caption": text or None, "formatting_entities": entities or None, "reply_to": _reply(topic)}
+        kwargs = {"caption": text or None, "formatting_entities": entities or None}
         if buttons:
             kwargs["buttons"] = buttons
         if msg["is_document"]:
             kwargs["force_document"] = True
-        await client.send_file(peer, media, **kwargs)
+        await _call(lambda rt: client.send_file(peer, media, reply_to=rt, **kwargs), topic)
     else:
-        kwargs = {
-            "formatting_entities": entities or None,
-            "reply_to": _reply(topic),
-            "link_preview": _preview(msg, campaign),
-        }
+        kwargs = {"formatting_entities": entities or None, "link_preview": _preview(msg, campaign)}
         if buttons:
             kwargs["buttons"] = buttons
-        await client.send_message(peer, text, **kwargs)
-
+        await _call(lambda rt: client.send_message(peer, text, reply_to=rt, **kwargs), topic)
 
 async def _send(client, target, msg, campaign) -> None:
     entities = load_entities(msg["entities"])
