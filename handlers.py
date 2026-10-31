@@ -1,7 +1,5 @@
 import json
 import logging
-import uuid
-from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
@@ -360,6 +358,13 @@ async def c_prev(cb: CallbackQuery) -> None:
 async def c_del(cb: CallbackQuery) -> None:
     cid = int(cb.data.split(":")[2])
     core.stop(cid)
+    camp = await db.get_campaign(cid)
+    try:
+        client = await core.get_client(await db.get_account(camp["account_id"]))
+        for msg in await db.campaign_messages(cid):
+            await core.drop_media(client, msg["saved_chat"], msg["saved_msg"])
+    except Exception as e:
+        log.warning("cleanup media: %s", e)
     await db.del_campaign(cid)
     await cb.message.edit_text("Удалено.", reply_markup=menu())
     await cb.answer()
@@ -398,17 +403,20 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
     if not text and not message.media:
         return
 
-    file_path = None
+    saved_chat = saved_msg = None
     doc = False
     if message.media:
-        folder = Path(cfg.media_dir) / str(cid)
-        folder.mkdir(parents=True, exist_ok=True)
+        camp = await db.get_campaign(cid)
         try:
-            saved = await bot.download(message, destination=folder / uuid.uuid4().hex)
-            if saved:
-                file_path = str(saved)
+            client = await core.get_client(await db.get_account(camp["account_id"]))
+            stored = await core.store_media(client, message.chat.id, message.message_id)
+            if stored:
+                saved_chat, saved_msg = stored
+            else:
+                await message.answer("⚠️ Файл не сохранился в Избранное, сообщение добавлено без медиа.")
         except Exception as e:
-            log.warning("download failed: %s", e)
+            log.warning("store media failed: %s", e)
+            await message.answer(f"⚠️ Не удалось сохранить файл: <code>{e}</code>")
         doc = core.is_document(getattr(message.document, "mime_type", None))
 
     mid = await db.add_message(
@@ -416,11 +424,9 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
         mode="copy",
         text=text,
         entities=core.dump_entities(message.entities or message.caption_entities),
-        media="1" if message.media else None,
-        file_path=file_path,
+        saved_chat=saved_chat,
+        saved_msg=saved_msg,
         is_document=doc,
-        src_chat=message.chat.id,
-        src_msg=message.message_id,
     )
 
     if core.has_url(text):
@@ -474,8 +480,13 @@ async def m_mode(cb: CallbackQuery) -> None:
 async def m_del(cb: CallbackQuery) -> None:
     mid = int(cb.data.split(":")[2])
     msg = await db.get_message(mid)
-    if msg["file_path"]:
-        Path(msg["file_path"]).unlink(missing_ok=True)
+    camp = await db.get_campaign(msg["campaign_id"])
+    if msg["saved_msg"] and camp:
+        try:
+            client = await core.get_client(await db.get_account(camp["account_id"]))
+            await core.drop_media(client, msg["saved_chat"], msg["saved_msg"])
+        except Exception as e:
+            log.warning("drop media: %s", e)
     await db.del_message(mid)
     items = await db.campaign_messages(msg["campaign_id"])
     await cb.message.edit_text("Удалено.", reply_markup=messages_kb(msg["campaign_id"], items))
@@ -536,7 +547,8 @@ async def g_list(cb: CallbackQuery) -> None:
     pages = max(1, (len(found) + PAGE - 1) // PAGE)
     page = min(page, pages - 1)
     await cb.message.edit_text(
-        f"👥 Групп: {len(found)}", reply_markup=groups_page(cid, found[page * PAGE:(page + 1) * PAGE], page, pages)
+        f"👥 Групп: {len(found)}",
+        reply_markup=groups_page(cid, found[page * PAGE:(page + 1) * PAGE], page, pages),
     )
 
 
@@ -598,7 +610,8 @@ async def g_chosen(cb: CallbackQuery) -> None:
     rows = await db.campaign_targets(cid)
     if not rows:
         await cb.message.edit_text(
-            "Список пуст.", reply_markup=K(inline_keyboard=[[B(text="⬅️ Назад", callback_data=f"c:open:{cid}")]])
+            "Список пуст.",
+            reply_markup=K(inline_keyboard=[[B(text="⬅️ Назад", callback_data=f"c:open:{cid}")]]),
         )
         await cb.answer()
         return
