@@ -570,24 +570,59 @@ async def g_list(cb: CallbackQuery) -> None:
     )
 
 
+TOPIC_PAGE = 10
+
+
+async def _show_topics(cb: CallbackQuery, state: FSMContext, cid: int, chat_id: int, page: int = 0) -> None:
+    topics = await _topics(await _client_for(cid), chat_id)
+    if not topics:
+        await cb.message.edit_text(
+            "В этой группе нет тем.",
+            reply_markup=K(inline_keyboard=[[B(text="⬅️ К списку", callback_data=f"g:chosen:{cid}")]]),
+        )
+        return
+
+    pages = max(1, (len(topics) + TOPIC_PAGE - 1) // TOPIC_PAGE)
+    page = max(0, min(page, pages - 1))
+    await state.update_data(page=page)
+
+    picked = (await state.get_data()).get("picked", [])
+    await cb.message.edit_text(
+        f"Выберите до двух тем (всего {len(topics)}):",
+        reply_markup=topics_kb(
+            cid, chat_id, topics[page * TOPIC_PAGE:(page + 1) * TOPIC_PAGE], picked, page, pages
+        ),
+    )
+
+
 @router.callback_query(F.data.startswith("g:add:"))
 async def g_add(cb: CallbackQuery, state: FSMContext) -> None:
     _, _, cid, chat_id = cb.data.split(":")
     cid, chat_id = int(cid), int(chat_id)
+
     client = await _client_for(cid)
     entity = await client.get_entity(chat_id)
     tid = await db.add_target(cid, chat_id, getattr(entity, "access_hash", None), entity.title or str(chat_id))
-    back = K(inline_keyboard=[[B(text="⬅️ К списку", callback_data=f"g:chosen:{cid}")]])
 
     topics = await _topics(client, chat_id)
     if not topics:
         await cb.answer("Добавлено")
-        await cb.message.edit_text(f"✅ {entity.title} добавлена.", reply_markup=back)
+        await cb.message.edit_text(
+            f"✅ {entity.title} добавлена.",
+            reply_markup=K(inline_keyboard=[[B(text="⬅️ К списку", callback_data=f"g:chosen:{cid}")]]),
+        )
         return
 
     await state.set_state(Camp.topics)
-    await state.update_data(cid=cid, chat_id=chat_id, tid=tid, picked=[])
-    await cb.message.edit_text("Выберите до двух тем:", reply_markup=topics_kb(cid, chat_id, topics, []))
+    await state.update_data(cid=cid, chat_id=chat_id, tid=tid, picked=[], page=0)
+    await _show_topics(cb, state, cid, chat_id, 0)
+    await cb.answer()
+
+
+@router.callback_query(Camp.topics, F.data.startswith("g:tpage:"))
+async def g_tpage(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, chat_id, page = cb.data.split(":")
+    await _show_topics(cb, state, int(cid), int(chat_id), int(page))
     await cb.answer()
 
 
@@ -595,7 +630,9 @@ async def g_add(cb: CallbackQuery, state: FSMContext) -> None:
 async def g_topic(cb: CallbackQuery, state: FSMContext) -> None:
     _, _, cid, chat_id, topic_id = cb.data.split(":")
     cid, chat_id, topic_id = int(cid), int(chat_id), int(topic_id)
-    picked = (await state.get_data()).get("picked", [])
+
+    data = await state.get_data()
+    picked = data.get("picked", [])
     if topic_id in picked:
         picked.remove(topic_id)
     else:
@@ -604,8 +641,8 @@ async def g_topic(cb: CallbackQuery, state: FSMContext) -> None:
             return
         picked.append(topic_id)
     await state.update_data(picked=picked)
-    topics = await _topics(await _client_for(cid), chat_id)
-    await cb.message.edit_text("Выберите до двух тем:", reply_markup=topics_kb(cid, chat_id, topics, picked))
+
+    await _show_topics(cb, state, cid, chat_id, data.get("page", 0))
     await cb.answer()
 
 
@@ -621,7 +658,6 @@ async def g_save(cb: CallbackQuery, state: FSMContext) -> None:
     )
     await cb.answer()
 
-
 @router.callback_query(F.data.startswith("g:chosen:"))
 async def g_chosen(cb: CallbackQuery) -> None:
     cid = int(cb.data.split(":")[2])
@@ -634,7 +670,7 @@ async def g_chosen(cb: CallbackQuery) -> None:
         await cb.answer()
         return
     kb = []
-    for row in rows:
+    for row in rows[:40]:
         count = len(json.loads(row["topic_ids"] or "[]"))
         label = row["title"] + (f" [{count} тем]" if count else "")
         kb.append([B(text=f"🗑 {label[:40]}", callback_data=f"g:rm:{cid}:{row['id']}")])
