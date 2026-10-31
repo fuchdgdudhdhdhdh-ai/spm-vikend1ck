@@ -14,7 +14,6 @@ from telethon.errors import (
     ChannelPrivateError,
     ChatAdminRequiredError,
     ChatSendMediaForbiddenError,
-    ChatSendPlainForbiddenError,
     ChatWriteForbiddenError,
     FileReferenceExpiredError,
     FloodWaitError,
@@ -231,8 +230,21 @@ SESSION_ERRORS = (
 )
 FATAL_TARGET = (
     ChatWriteForbiddenError, ChatAdminRequiredError, ChatSendMediaForbiddenError,
-    ChatSendPlainForbiddenError, UserBannedInChannelError, ChannelPrivateError,
+    UserBannedInChannelError, ChannelPrivateError,
 )
+
+_FATAL_TEXT = (
+    "CHAT_WRITE_FORBIDDEN", "CHAT_SEND_PLAIN_FORBIDDEN", "CHAT_SEND_MEDIA_FORBIDDEN",
+    "CHAT_SEND_DOCS_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "USER_BANNED_IN_CHANNEL",
+    "CHANNEL_PRIVATE", "CHAT_RESTRICTED",
+)
+
+
+def _is_fatal(e) -> bool:
+    if isinstance(e, FATAL_TARGET):
+        return True
+    text = str(e).upper()
+    return any(x in text for x in _FATAL_TEXT)
 MAX_FAILS = 3
 
 
