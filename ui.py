@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton as B, InlineKeyboardMarkup as K
 from settings import cfg
 
 DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+TOPIC_PAGE = 10
 
 SELLER_TEXT = (
     "%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%2C%20%D1%85%D0%BE%D1%87%D1%83%20"
@@ -109,9 +110,6 @@ def groups_page(cid: int, rows, page: int, pages: int) -> K:
     return K(inline_keyboard=kb)
 
 
-TOPIC_PAGE = 10
-
-
 def topics_kb(cid: int, chat_id: int, topics, picked, page: int, pages: int) -> K:
     kb = []
     for t in topics:
@@ -128,7 +126,7 @@ def topics_kb(cid: int, chat_id: int, topics, picked, page: int, pages: int) -> 
     kb.append(nav)
 
     kb.append([B(text=f"💾 Сохранить ({len(picked)})", callback_data=f"g:save:{cid}:{chat_id}")])
-    return K(inline_keyboard=kb))
+    return K(inline_keyboard=kb)
 
 
 def timing_kb(cid: int) -> K:
