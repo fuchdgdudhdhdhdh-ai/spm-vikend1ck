@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton as B, InlineKeyboardMarkup as K, Message,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent, LinkPreviewOptions,
-    MessageEntity,
+    MessageEntity, User,
 )
 from telethon import TelegramClient
 from telethon.errors import BotInlineDisabledError, SessionPasswordNeededError
@@ -504,7 +504,7 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
         cid,
         mode="copy",
         text=text,
-        entities=core.dump_entities(message.entities or message.caption_entities),
+        entities=core.entities_from_tg(message.entities or message.caption_entities),
         saved_chat=saved_chat,
         saved_msg=saved_msg,
         is_document=doc,
@@ -631,6 +631,7 @@ _ENT = {
     "MessageEntityTextUrl": "text_link", "MessageEntityUrl": "url",
     "MessageEntityEmail": "email", "MessageEntityPhone": "phone_number",
     "MessageEntityMention": "mention", "MessageEntityHashtag": "hashtag",
+    "MessageEntityCustomEmoji": "custom_emoji", "MessageEntityMentionName": "text_mention",
     "MessageEntityCashtag": "cashtag", "MessageEntityBotCommand": "bot_command",
 }
 
@@ -646,6 +647,10 @@ def bot_entities(raw: str):
             kwargs["url"] = e.url
         elif kind == "pre" and getattr(e, "language", None):
             kwargs["language"] = e.language
+        elif kind == "text_mention" and getattr(e, "user_id", None):
+            kwargs["user"] = User(id=e.user_id, is_bot=False, first_name="")
+        elif kind == "custom_emoji" and getattr(e, "document_id", None):
+            kwargs["custom_emoji_id"] = str(e.document_id)
         out.append(MessageEntity(**kwargs))
     return out
 
