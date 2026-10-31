@@ -2,14 +2,16 @@ import asyncio
 import json
 import logging
 import random
-from pathlib import Path
+import re
 
 from telethon import Button, TelegramClient, events, types
 from telethon.errors import (
     AuthKeyDuplicatedError,
     AuthKeyError,
     AuthKeyUnregisteredError,
+    FileReferenceExpiredError,
     FloodWaitError,
+    RPCError,
     SessionRevokedError,
     SlowModeWaitError,
     UserDeactivatedBanError,
@@ -75,7 +77,7 @@ async def shutdown_clients() -> None:
         await drop_client(account_id)
 
 
-# ================= форматирование =================
+# ================= форматирование и медиа =================
 
 _ENTITIES = {n: getattr(types, n) for n in dir(types) if n.startswith("MessageEntity")}
 
@@ -105,6 +107,22 @@ def load_entities(raw: str):
     return res
 
 
+def media_input(message):
+    """InputMedia со свежим file_reference из сохранённого сообщения."""
+    media = getattr(message, "media", None)
+    if isinstance(media, types.MessageMediaPhoto) and isinstance(media.photo, types.Photo):
+        photo = media.photo
+        return types.InputMediaPhoto(
+            types.InputPhoto(photo.id, photo.access_hash, photo.file_reference)
+        )
+    if isinstance(media, types.MessageMediaDocument) and isinstance(media.document, types.Document):
+        doc = media.document
+        return types.InputMediaDocument(
+            types.InputDocument(doc.id, doc.access_hash, doc.file_reference)
+        )
+    return None
+
+
 def load_buttons(raw: str):
     out = []
     for row in json.loads(raw or "[]"):
@@ -132,6 +150,26 @@ def has_url(text: str | None) -> bool:
 
 def is_document(mime: str | None) -> bool:
     return not (mime or "").startswith(("image/", "video/"))
+
+
+async def store_media(client, source_chat: int, source_msg: int) -> tuple[int, int] | None:
+    """Пересылает сообщение в Избранное и возвращает (chat_id, msg_id)."""
+    try:
+        me = await client.get_me()
+        forwarded = await client.forward_messages(me.id, source_msg, source_chat)
+        return forwarded.chat_id or me.id, forwarded.id
+    except Exception as e:
+        log.warning("store_media: %s", e)
+        return None
+
+
+async def drop_media(client, chat_id: int | None, msg_id: int | None) -> None:
+    if not chat_id or not msg_id:
+        return
+    try:
+        await client.delete_messages(chat_id, [msg_id])
+    except Exception:
+        pass
 
 
 # ================= отправка =================
@@ -172,24 +210,13 @@ def _preview(msg, campaign) -> bool:
     return bool(msg["preview"] if msg["preview"] is not None else campaign["link_preview"])
 
 
-async def _local_file(client, msg) -> str | None:
-    path = msg["file_path"]
-    if path and Path(path).exists():
-        return path
-    if not msg["src_msg"]:
+async def _saved(client, msg):
+    if not msg["saved_msg"]:
         return None
     try:
-        source = await client.get_messages(msg["src_chat"], ids=msg["src_msg"])
+        return await client.get_messages(msg["saved_chat"], ids=msg["saved_msg"])
     except Exception:
         return None
-    if not source or not source.media:
-        return None
-    dest = Path(cfg.media_dir) / "recover"
-    dest.mkdir(parents=True, exist_ok=True)
-    got = await client.download_media(source, file=str(dest / str(msg["id"])))
-    if got:
-        await db.set_message(msg["id"], file_path=got)
-    return got
 
 
 async def _send(client, target, msg, campaign) -> None:
@@ -198,7 +225,7 @@ async def _send(client, target, msg, campaign) -> None:
     topics = json.loads(target["topic_ids"] or "[]") or [None]
 
     via = None
-    if campaign["via_bot"] and (msg["file_path"] or msg["media"]):
+    if campaign["via_bot"] and msg["saved_msg"]:
         try:
             via = await client.get_input_entity(campaign["via_bot"])
         except Exception:
@@ -207,14 +234,16 @@ async def _send(client, target, msg, campaign) -> None:
     for topic in topics:
         for attempt in (1, 2):
             try:
-                if msg["mode"] == "forward" and msg["src_msg"]:
+                if msg["mode"] == "forward" and msg["saved_msg"]:
                     await client.forward_messages(
-                        target["chat_id"], msg["src_msg"], msg["src_chat"], reply_to=topic,
+                        target["chat_id"], msg["saved_msg"], msg["saved_chat"], reply_to=topic,
                     )
-                elif msg["file_path"] or msg["media"]:
-                    path = await _local_file(client, msg)
-                    if path is None:
-                        raise RuntimeError("файл недоступен")
+                    break
+
+                source = await _saved(client, msg)
+                media = media_input(source) if source else None
+
+                if media is not None:
                     kwargs = {
                         "caption": msg["text"] or None,
                         "formatting_entities": entities or None,
@@ -227,10 +256,10 @@ async def _send(client, target, msg, campaign) -> None:
                     if via is not None:
                         kwargs["via_bot_id"] = via
                     try:
-                        await client.send_file(target["chat_id"], path, **kwargs)
+                        await client.send_file(target["chat_id"], media, **kwargs)
                     except TypeError:
                         kwargs.pop("via_bot_id", None)
-                        await client.send_file(target["chat_id"], path, **kwargs)
+                        await client.send_file(target["chat_id"], media, **kwargs)
                 else:
                     kwargs = {
                         "formatting_entities": entities or None,
@@ -248,6 +277,11 @@ async def _send(client, target, msg, campaign) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if isinstance(e, (FileReferenceExpiredError,)) or (
+                    isinstance(e, RPCError) and "FILE_REFERENCE" in str(e).upper()
+                ) and attempt == 1:
+                    await asyncio.sleep(1)
+                    continue
                 if attempt == 2:
                     log.warning("send %s: %s", target["chat_id"], e)
                 await asyncio.sleep(2)
@@ -258,7 +292,7 @@ async def _guarded(account, target, msg, campaign) -> None:
         try:
             client = await get_client(account)
             return await _send(client, target, msg, campaign)
-        except SESSION_ERRORS as e:
+        except SESSION_ERRORS:
             await drop_client(account["id"])
             if attempt == 2:
                 raise
@@ -311,8 +345,6 @@ async def _loop(cid: int) -> None:
 
 # ================= секретарь =================
 
-import re
-
 SECRETARY = re.compile(r"^\.старт\s+(.+)$", re.I)
 
 
@@ -343,7 +375,7 @@ async def secretary_handler(event) -> None:
             getattr(chat, "title", None) or str(chat_id),
         )
         if topic:
-            row = await db.fetchone("SELECT topic_ids FROM targets WHERE id=?", (tid,))
+            row = await db.fetchone("SELECT topic_ids FROM targets WHERE id=$1", tid)
             current = json.loads(row["topic_ids"] or "[]")
             if topic not in current:
                 await db.set_topics(tid, (current + [topic])[:2])
