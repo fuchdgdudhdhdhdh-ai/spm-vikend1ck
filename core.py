@@ -108,7 +108,8 @@ def load_entities(raw: str):
 
 
 def media_input(message):
-    """InputMedia со свежим file_reference из сохранённого сообщения."""
+    if message is None:
+        return None
     media = getattr(message, "media", None)
     if isinstance(media, types.MessageMediaPhoto) and isinstance(media.photo, types.Photo):
         photo = media.photo
@@ -153,7 +154,6 @@ def is_document(mime: str | None) -> bool:
 
 
 async def store_media(client, source_chat: int, source_msg: int) -> tuple[int, int] | None:
-    """Пересылает сообщение в Избранное и возвращает (chat_id, msg_id)."""
     try:
         me = await client.get_me()
         forwarded = await client.forward_messages(me.id, source_msg, source_chat)
@@ -195,11 +195,21 @@ def stop(cid: int) -> None:
         task.cancel()
 
 
+def _on_task_done(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        log.error("campaign task crashed: %r", exc, exc_info=exc)
+
+
 async def start(cid: int) -> None:
     if is_running(cid):
         return
     await db.set_campaign(cid, status="running")
-    _tasks[cid] = asyncio.create_task(_loop(cid))
+    task = asyncio.create_task(_loop(cid))
+    task.add_done_callback(_on_task_done)
+    _tasks[cid] = task
 
 
 async def _pause(lo: int, hi: int) -> None:
@@ -220,12 +230,21 @@ async def _saved(client, msg):
 
 
 async def _send(client, target, msg, campaign) -> None:
-    entities = load_entities(msg["entities"])
-    buttons = load_buttons(msg["buttons"])
+    try:
+        entities = load_entities(msg["entities"])
+    except Exception as e:
+        log.warning("msg %s bad entities: %s", msg["id"], e)
+        entities = []
+    try:
+        buttons = load_buttons(msg["buttons"])
+    except Exception as e:
+        log.warning("msg %s bad buttons: %s", msg["id"], e)
+        buttons = None
+
     topics = json.loads(target["topic_ids"] or "[]") or [None]
 
     via = None
-    if campaign["via_bot"] and msg["saved_msg"]:
+    if campaign["via_bot"]:
         try:
             via = await client.get_input_entity(campaign["via_bot"])
         except Exception:
@@ -241,7 +260,7 @@ async def _send(client, target, msg, campaign) -> None:
                     break
 
                 source = await _saved(client, msg)
-                media = media_input(source) if source else None
+                media = media_input(source)
 
                 if media is not None:
                     kwargs = {
@@ -268,8 +287,8 @@ async def _send(client, target, msg, campaign) -> None:
                     }
                     if buttons:
                         kwargs["buttons"] = buttons
-                    if campaign["via_bot"]:
-                        kwargs["via_bot"] = campaign["via_bot"]
+                    if via is not None:
+                        kwargs["via_bot"] = via
                     await client.send_message(target["chat_id"], msg["text"], **kwargs)
                 break
             except (FloodWaitError, SlowModeWaitError) as e:
@@ -283,7 +302,7 @@ async def _send(client, target, msg, campaign) -> None:
                     await asyncio.sleep(1)
                     continue
                 if attempt == 2:
-                    log.warning("send %s: %s", target["chat_id"], e)
+                    log.warning("send chat=%s msg=%s: %s", target["chat_id"], msg["id"], e)
                 await asyncio.sleep(2)
 
 
@@ -297,6 +316,9 @@ async def _guarded(account, target, msg, campaign) -> None:
             if attempt == 2:
                 raise
             await asyncio.sleep(3)
+        except RuntimeError:
+            await drop_client(account["id"])
+            raise
 
 
 async def _loop(cid: int) -> None:
@@ -331,16 +353,31 @@ async def _loop(cid: int) -> None:
                             await db.set_campaign(cid, status="stopped")
                             return
                         await asyncio.sleep(min(60, 5 * fails))
+                    except RuntimeError as e:
+                        log.error("account dead %s: %s", account["id"], e)
+                        await db.set_account_status(account["id"], "dead")
+                        await db.set_campaign(cid, status="stopped")
+                        return
                     except asyncio.CancelledError:
                         raise
+                    except Exception as e:
+                        log.exception(
+                            "send cid=%s chat=%s msg=%s: %s",
+                            cid, target["chat_id"], msg["id"], e,
+                        )
                     await _pause(campaign["delay_min"], campaign["delay_max"])
 
             await _pause(campaign["cycle_min"], campaign["cycle_max"])
     except asyncio.CancelledError:
         pass
+    except Exception:
+        log.exception("loop cid=%s crashed", cid)
     finally:
         _tasks.pop(cid, None)
-        await db.set_campaign(cid, status="stopped")
+        try:
+            await db.set_campaign(cid, status="stopped")
+        except Exception:
+            pass
 
 
 # ================= секретарь =================
