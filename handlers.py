@@ -14,7 +14,7 @@ import core
 import db
 from settings import cfg
 from ui import (
-    Admin, Auth, Camp, accounts_kb, campaign_card, code_pad, groups_page,
+    TOPIC_PAGE, Admin, Auth, Camp, accounts_kb, campaign_card, code_pad, groups_page,
     menu, message_card, messages_kb, paywall, preview_kb, timing_kb, topics_kb,
 )
 
@@ -23,22 +23,35 @@ router = Router()
 
 _pending: dict[int, dict] = {}
 PAGE = 8
-
+LIST_CAP = 40
 MEDIA_FIELDS = ("photo", "video", "document", "audio", "voice", "video_note", "animation", "sticker")
+
+PLANS = (
+    "💳 <b>Подписка</b>\n\n• 0.5 TON / неделя\n• 50 ⭐ / неделя\n• 50 ₽ / неделя\n\n"
+    f"Для получения доступа напишите @{cfg.seller} — выдача вручную."
+)
 
 
 def media_of(message: Message) -> tuple[bool, str | None]:
-    """(есть ли медиа, mime-тип если известен)."""
     for field in MEDIA_FIELDS:
         obj = getattr(message, field, None)
         if obj:
             return True, getattr(obj, "mime_type", None)
     return False, None
 
-PLANS = (
-    "💳 <b>Подписка</b>\n\n• 0.5 TON / неделя\n• 50 ⭐ / неделя\n• 50 ₽ / неделя\n\n"
-    f"Для получения доступа напишите @{cfg.seller} — выдача вручную."
-)
+
+def chunk_text(text: str, size: int = 3500) -> list[str]:
+    out, buf, cur = [], [], 0
+    for ch in text:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if cur + w > size:
+            out.append("".join(buf))
+            buf, cur = [], 0
+        buf.append(ch)
+        cur += w
+    if buf:
+        out.append("".join(buf))
+    return out or [""]
 
 
 async def gate(event) -> bool:
@@ -254,7 +267,7 @@ async def c_list(cb: CallbackQuery) -> None:
         return
     lines = "\n".join(f"• #{r['id']} {r['title']} — {r['status']}" for r in rows)
     kb = K(inline_keyboard=[
-        *[[B(text=f"#{r['id']} {r['title'][:30]}", callback_data=f"c:open:{r['id']}")] for r in rows],
+        *[[B(text=f"#{r['id']} {r['title'][:30]}", callback_data=f"c:open:{r['id']}")] for r in rows[:LIST_CAP]],
         [B(text="⬅️ Назад", callback_data="menu")],
     ])
     await cb.message.edit_text(f"📨 <b>Рассылки</b>\n\n{lines}\n\n/new — создать", reply_markup=kb)
@@ -276,6 +289,9 @@ async def c_new(message: Message, state: FSMContext) -> None:
 async def c_title(message: Message, state: FSMContext) -> None:
     title = (message.text or "").strip()
     if not title:
+        return
+    if len(title) > 60:
+        await message.answer("Название длиннее 60 символов.")
         return
     if await db.by_title(message.from_user.id, title):
         await message.answer("Такое название уже есть.")
@@ -449,13 +465,12 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
     if core.has_url(text):
         await state.set_state(Camp.preview)
         await state.update_data(mid=mid)
-        await message.answer(
-            "В сообщении есть ссылка. Показывать предпросмотр?", reply_markup=preview_kb(mid)
-        )
+        await message.answer("В сообщении есть ссылка. Показывать предпросмотр?", reply_markup=preview_kb(mid))
         return
 
     await state.clear()
     await message.answer(f"Сообщение #{mid} добавлено.", reply_markup=message_card(mid, cid, "copy"))
+
 
 @router.callback_query(Camp.preview, F.data.startswith("m:prev:"))
 async def m_preview(cb: CallbackQuery, state: FSMContext) -> None:
@@ -475,13 +490,33 @@ async def m_preview(cb: CallbackQuery, state: FSMContext) -> None:
 async def m_open(cb: CallbackQuery) -> None:
     mid = int(cb.data.split(":")[2])
     msg = await db.get_message(mid)
-    preview = (msg["text"] or "")[:300] or "[медиа]"
+    if not msg:
+        await cb.answer("Не найдено")
+        return
+
+    meta = []
+    if msg["saved_msg"]:
+        meta.append("медиа")
+    if msg["mode"] == "forward":
+        meta.append("пересылка")
     if msg["preview"] is not None:
-        preview += f"\n\nПредпросмотр: {'вкл' if msg['preview'] else 'выкл'}"
-    await cb.message.edit_text(
-        f"<b>Сообщение #{mid}</b>\n\n{preview}",
-        reply_markup=message_card(mid, msg["campaign_id"], msg["mode"]),
-    )
+        meta.append("предпросмотр: " + ("вкл" if msg["preview"] else "выкл"))
+    buttons = json.loads(msg["buttons"] or "[]")
+    if buttons:
+        meta.append(f"кнопок: {sum(len(r) for r in buttons)}")
+
+    head = f"Сообщение #{mid}"
+    if meta:
+        head += "\n" + " · ".join(meta)
+
+    parts = chunk_text(head + "\n\n" + (msg["text"] or "[без текста]"))
+    await cb.message.edit_text(parts[0], parse_mode=None)
+
+    last = cb.message
+    for part in parts[1:]:
+        last = await last.answer(part, parse_mode=None)
+
+    await last.edit_reply_markup(reply_markup=message_card(mid, msg["campaign_id"], msg["mode"]))
     await cb.answer()
 
 
@@ -489,9 +524,15 @@ async def m_open(cb: CallbackQuery) -> None:
 async def m_mode(cb: CallbackQuery) -> None:
     mid = int(cb.data.split(":")[2])
     msg = await db.get_message(mid)
-    await db.set_message(mid, mode="forward" if msg["mode"] == "copy" else "copy")
-    await cb.answer()
-    await m_open(cb)
+    new = "forward" if msg["mode"] == "copy" else "copy"
+    await db.set_message(mid, mode=new)
+    await cb.answer("Режим: " + ("пересылка" if new == "forward" else "копия"))
+    try:
+        await cb.message.edit_reply_markup(
+            reply_markup=message_card(mid, msg["campaign_id"], new)
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("m:del:"))
@@ -552,27 +593,6 @@ async def _topics(client, chat_id: int):
     return [{"id": t.id, "title": t.title} for t in res.topics if getattr(t, "title", None)]
 
 
-@router.callback_query(F.data.startswith("g:list:"))
-async def g_list(cb: CallbackQuery) -> None:
-    _, _, cid, page = cb.data.split(":")
-    cid, page = int(cid), int(page)
-    client = await _client_for(cid)
-    await cb.answer("Сканирую…")
-    found = []
-    async for dialog in client.iter_dialogs():
-        if dialog.is_group:
-            found.append({"id": dialog.id, "title": dialog.name or str(dialog.id)})
-    pages = max(1, (len(found) + PAGE - 1) // PAGE)
-    page = min(page, pages - 1)
-    await cb.message.edit_text(
-        f"👥 Групп: {len(found)}",
-        reply_markup=groups_page(cid, found[page * PAGE:(page + 1) * PAGE], page, pages),
-    )
-
-
-TOPIC_PAGE = 10
-
-
 async def _show_topics(cb: CallbackQuery, state: FSMContext, cid: int, chat_id: int, page: int = 0) -> None:
     topics = await _topics(await _client_for(cid), chat_id)
     if not topics:
@@ -592,6 +612,24 @@ async def _show_topics(cb: CallbackQuery, state: FSMContext, cid: int, chat_id: 
         reply_markup=topics_kb(
             cid, chat_id, topics[page * TOPIC_PAGE:(page + 1) * TOPIC_PAGE], picked, page, pages
         ),
+    )
+
+
+@router.callback_query(F.data.startswith("g:list:"))
+async def g_list(cb: CallbackQuery) -> None:
+    _, _, cid, page = cb.data.split(":")
+    cid, page = int(cid), int(page)
+    client = await _client_for(cid)
+    await cb.answer("Сканирую…")
+    found = []
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group:
+            found.append({"id": dialog.id, "title": dialog.name or str(dialog.id)})
+    pages = max(1, (len(found) + PAGE - 1) // PAGE)
+    page = min(page, pages - 1)
+    await cb.message.edit_text(
+        f"👥 Групп: {len(found)}",
+        reply_markup=groups_page(cid, found[page * PAGE:(page + 1) * PAGE], page, pages),
     )
 
 
@@ -658,6 +696,7 @@ async def g_save(cb: CallbackQuery, state: FSMContext) -> None:
     )
     await cb.answer()
 
+
 @router.callback_query(F.data.startswith("g:chosen:"))
 async def g_chosen(cb: CallbackQuery) -> None:
     cid = int(cb.data.split(":")[2])
@@ -670,7 +709,7 @@ async def g_chosen(cb: CallbackQuery) -> None:
         await cb.answer()
         return
     kb = []
-    for row in rows[:40]:
+    for row in rows[:LIST_CAP]:
         count = len(json.loads(row["topic_ids"] or "[]"))
         label = row["title"] + (f" [{count} тем]" if count else "")
         kb.append([B(text=f"🗑 {label[:40]}", callback_data=f"g:rm:{cid}:{row['id']}")])
