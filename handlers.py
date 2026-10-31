@@ -24,6 +24,17 @@ router = Router()
 _pending: dict[int, dict] = {}
 PAGE = 8
 
+MEDIA_FIELDS = ("photo", "video", "document", "audio", "voice", "video_note", "animation", "sticker")
+
+
+def media_of(message: Message) -> tuple[bool, str | None]:
+    """(есть ли медиа, mime-тип если известен)."""
+    for field in MEDIA_FIELDS:
+        obj = getattr(message, field, None)
+        if obj:
+            return True, getattr(obj, "mime_type", None)
+    return False, None
+
 PLANS = (
     "💳 <b>Подписка</b>\n\n• 0.5 TON / неделя\n• 50 ⭐ / неделя\n• 50 ₽ / неделя\n\n"
     f"Для получения доступа напишите @{cfg.seller} — выдача вручную."
@@ -398,14 +409,20 @@ async def m_add(cb: CallbackQuery, state: FSMContext) -> None:
 @router.message(Camp.message)
 async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
     data = await state.get_data()
-    cid = data["cid"]
+    cid = data.get("cid")
+    if not cid:
+        await state.clear()
+        await message.answer("Контекст рассылки потерян, откройте её заново.")
+        return
+
     text = message.text or message.caption or ""
-    if not text and not message.media:
+    has_media, mime = media_of(message)
+    if not text and not has_media:
         return
 
     saved_chat = saved_msg = None
     doc = False
-    if message.media:
+    if has_media:
         camp = await db.get_campaign(cid)
         try:
             client = await core.get_client(await db.get_account(camp["account_id"]))
@@ -417,7 +434,7 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
         except Exception as e:
             log.warning("store media failed: %s", e)
             await message.answer(f"⚠️ Не удалось сохранить файл: <code>{e}</code>")
-        doc = core.is_document(getattr(message.document, "mime_type", None))
+        doc = core.is_document(mime)
 
     mid = await db.add_message(
         cid,
@@ -432,12 +449,13 @@ async def m_receive(message: Message, bot: Bot, state: FSMContext) -> None:
     if core.has_url(text):
         await state.set_state(Camp.preview)
         await state.update_data(mid=mid)
-        await message.answer("В сообщении есть ссылка. Показывать предпросмотр?", reply_markup=preview_kb(mid))
+        await message.answer(
+            "В сообщении есть ссылка. Показывать предпросмотр?", reply_markup=preview_kb(mid)
+        )
         return
 
     await state.clear()
     await message.answer(f"Сообщение #{mid} добавлено.", reply_markup=message_card(mid, cid, "copy"))
-
 
 @router.callback_query(Camp.preview, F.data.startswith("m:prev:"))
 async def m_preview(cb: CallbackQuery, state: FSMContext) -> None:
