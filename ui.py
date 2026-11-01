@@ -26,6 +26,7 @@ class Camp(StatesGroup):
     preview = State()
     buttons = State()
     topics = State()
+    timing = State()
 
 
 class Admin(StatesGroup):
@@ -135,6 +136,7 @@ def timing_kb(cid: int) -> K:
         [B(text="10с", callback_data=f"t:set:{cid}:dmin:10"),
          B(text="30с", callback_data=f"t:set:{cid}:dmin:30"),
          B(text="60с", callback_data=f"t:set:{cid}:dmin:60")],
+        [B(text="✏️ Своё значение (сообщения)", callback_data=f"t:in:{cid}:delay")],
         [B(text="Диапазон", callback_data="noop")],
         [B(text="10-25с", callback_data=f"t:rng:{cid}:10:25"),
          B(text="30-90с", callback_data=f"t:rng:{cid}:30:90")],
@@ -142,7 +144,20 @@ def timing_kb(cid: int) -> K:
         [B(text="2м", callback_data=f"t:set:{cid}:cmin:120"),
          B(text="10м", callback_data=f"t:set:{cid}:cmin:600"),
          B(text="1ч", callback_data=f"t:set:{cid}:cmin:3600")],
+        [B(text="✏️ Своё значение (цикл)", callback_data=f"t:in:{cid}:cycle")],
         [B(text="⬅️ Назад", callback_data=f"c:open:{cid}")],
+    ])
+
+
+def group_timing_kb(cid: int, tid: int) -> K:
+    return K(inline_keyboard=[
+        [B(text="Интервал между циклами для этой группы", callback_data="noop")],
+        [B(text="2м", callback_data=f"g:cyc:{cid}:{tid}:120"),
+         B(text="10м", callback_data=f"g:cyc:{cid}:{tid}:600"),
+         B(text="1ч", callback_data=f"g:cyc:{cid}:{tid}:3600")],
+        [B(text="✏️ Своё значение", callback_data=f"g:cyc_in:{cid}:{tid}")],
+        [B(text="↩️ Как в рассылке", callback_data=f"g:cyc_reset:{cid}:{tid}")],
+        [B(text="⬅️ Назад", callback_data=f"g:chosen:{cid}")],
     ])
 
 
