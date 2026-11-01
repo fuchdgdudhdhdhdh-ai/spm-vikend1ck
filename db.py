@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS targets(
     access_hash BIGINT,
     title TEXT,
     topic_ids TEXT DEFAULT '[]',
+    cycle_min INT,
+    cycle_max INT,
     UNIQUE(campaign_id, chat_id)
 );
 CREATE TABLE IF NOT EXISTS admins(
@@ -67,6 +69,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_campaign ON messages(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_targets_campaign ON targets(campaign_id);
 """
 
+MIGRATIONS = (
+    "ALTER TABLE targets ADD COLUMN IF NOT EXISTS cycle_min INT",
+    "ALTER TABLE targets ADD COLUMN IF NOT EXISTS cycle_max INT",
+)
+
 
 async def init() -> None:
     global _pool
@@ -75,6 +82,8 @@ async def init() -> None:
     _pool = await asyncpg.create_pool(cfg.database_url, min_size=1, max_size=5, command_timeout=30)
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA)
+        for sql in MIGRATIONS:
+            await conn.execute(sql)
 
 
 async def close() -> None:
@@ -281,6 +290,11 @@ async def campaign_targets(cid: int):
 
 async def set_topics(tid: int, topic_ids: list[int]) -> None:
     await execute("UPDATE targets SET topic_ids=$1 WHERE id=$2", json.dumps(topic_ids), tid)
+
+
+async def set_target_cycle(tid: int, lo: int | None, hi: int | None) -> None:
+    """Свой интервал между циклами для группы. None/None — брать значения из рассылки."""
+    await execute("UPDATE targets SET cycle_min=$1, cycle_max=$2 WHERE id=$3", lo, hi, tid)
 
 
 async def del_target(tid: int) -> None:
