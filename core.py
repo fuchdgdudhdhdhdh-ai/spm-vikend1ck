@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 import json
 import logging
 import random
@@ -459,8 +460,17 @@ async def _guarded(account, target, msg, campaign) -> None:
             await asyncio.sleep(3)
 
 
+def _cycle(target, campaign) -> tuple[int, int]:
+    lo = target["cycle_min"] if target["cycle_min"] is not None else campaign["cycle_min"]
+    hi = target["cycle_max"] if target["cycle_max"] is not None else campaign["cycle_max"]
+    lo, hi = max(1, int(lo or 1)), max(1, int(hi or 1))
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
 async def _loop(cid: int) -> None:
     log.info("campaign %s started", cid)
+    next_due: dict[int, float] = {}
+    cursor: dict[int, int] = {}
     try:
         while True:
             campaign = await db.get_campaign(cid)
@@ -477,27 +487,44 @@ async def _loop(cid: int) -> None:
                 log.warning("campaign %s: нет групп или сообщений, остановка", cid)
                 return
 
-            for target in targets:
-                for msg in messages:
-                    try:
-                        await _guarded(account, target, msg, campaign)
-                        _session_fails[account["id"]] = 0
-                        await db.set_account_status(account["id"], "ok")
-                    except asyncio.CancelledError:
-                        raise
-                    except SESSION_ERRORS as e:
-                        fails = _session_fails.get(account["id"], 0) + 1
-                        _session_fails[account["id"]] = fails
-                        log.error("session dead %s: %r", account["id"], e)
-                        if fails >= MAX_FAILS:
-                            await db.set_account_status(account["id"], "dead")
-                            return
-                        await asyncio.sleep(min(60, 5 * fails))
-                    except Exception as e:
-                        log.exception("campaign %s: сбой отправки в %s: %r", cid, target["chat_id"], e)
-                    await _pause(campaign["delay_min"], campaign["delay_max"])
+            alive = {t["id"] for t in targets}
+            for tid in [k for k in next_due if k not in alive]:
+                next_due.pop(tid, None)
+                cursor.pop(tid, None)
 
-            await _pause(campaign["cycle_min"], campaign["cycle_max"])
+            now = time.monotonic()
+            due = [t for t in targets if next_due.get(t["id"], 0.0) <= now]
+            if not due:
+                wait = min(next_due[t["id"]] for t in targets if t["id"] in next_due)
+                await asyncio.sleep(max(0.2, min(1.0, wait - now)))
+                continue
+
+            for target in due:
+                # один цикл = одно сообщение, дальше по кругу
+                pos = cursor.get(target["id"], 0) % len(messages)
+                cursor[target["id"]] = pos + 1
+                msg = messages[pos]
+
+                try:
+                    await _guarded(account, target, msg, campaign)
+                    _session_fails[account["id"]] = 0
+                    await db.set_account_status(account["id"], "ok")
+                except asyncio.CancelledError:
+                    raise
+                except SESSION_ERRORS as e:
+                    fails = _session_fails.get(account["id"], 0) + 1
+                    _session_fails[account["id"]] = fails
+                    log.error("session dead %s: %r", account["id"], e)
+                    if fails >= MAX_FAILS:
+                        await db.set_account_status(account["id"], "dead")
+                        return
+                    await asyncio.sleep(min(60, 5 * fails))
+                except Exception as e:
+                    log.exception("campaign %s: сбой отправки в %s: %r", cid, target["chat_id"], e)
+
+                lo, hi = _cycle(target, campaign)
+                next_due[target["id"]] = time.monotonic() + random.randint(lo, hi)
+                await _pause(campaign["delay_min"], campaign["delay_max"])
     except asyncio.CancelledError:
         pass
     finally:
@@ -507,7 +534,6 @@ async def _loop(cid: int) -> None:
         except Exception:
             pass
         log.info("campaign %s stopped", cid)
-
 
 # ================= секретарь =================
 
