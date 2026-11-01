@@ -852,7 +852,12 @@ async def g_chosen(cb: CallbackQuery) -> None:
     for row in rows[:LIST_CAP]:
         count = len(json.loads(row["topic_ids"] or "[]"))
         label = row["title"] + (f" [{count} тем]" if count else "")
-        kb.append([B(text=f"🗑 {label[:40]}", callback_data=f"g:rm:{cid}:{row['id']}")])
+        if row["cycle_min"] is not None:
+            label += f" ⏱{row['cycle_min']}-{row['cycle_max']}с"
+        kb.append([
+            B(text=f"⏱ {label[:38]}", callback_data=f"g:time:{cid}:{row['id']}"),
+            B(text="🗑", callback_data=f"g:rm:{cid}:{row['id']}"),
+        ])
     kb.append([B(text="⬅️ Назад", callback_data=f"c:open:{cid}")])
     await cb.message.edit_text("Выбранные (нажмите, чтобы убрать):", reply_markup=K(inline_keyboard=kb))
     await cb.answer()
@@ -867,13 +872,46 @@ async def g_rm(cb: CallbackQuery) -> None:
 
 # ================= интервалы =================
 
+UNITS = {"с": 1, "s": 1, "м": 60, "m": 60, "мин": 60, "ч": 3600, "h": 3600}
+
+
+def parse_interval(raw: str) -> tuple[int, int] | None:
+    """'30' / '30-90' / '2м' / '1ч-2ч' -> секунды."""
+    text = (raw or "").strip().lower().replace(" ", "")
+    if not text:
+        return None
+
+    def one(part: str) -> int | None:
+        for suffix in sorted(UNITS, key=len, reverse=True):
+            head = part[:-len(suffix)]
+            if part.endswith(suffix) and head.replace(".", "", 1).isdigit():
+                return int(float(head) * UNITS[suffix])
+        return int(part) if part.isdigit() else None
+
+    lo_raw, _, hi_raw = text.partition("-")
+    lo = one(lo_raw)
+    hi = one(hi_raw) if hi_raw else lo
+    if lo is None or hi is None:
+        return None
+    lo, hi = max(1, lo), max(1, hi)
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
+HINT = "Формат: <code>30</code>, <code>30-90</code>, <code>2м</code>, <code>1ч</code>, <code>10м-30м</code>."
+
+
+def _timing_text(camp) -> str:
+    return (
+        f"⏱ Интервалы\n\nСообщения: {camp['delay_min']}-{camp['delay_max']}с\n"
+        f"Цикл: {camp['cycle_min']}-{camp['cycle_max']}с\n\n"
+        "Один цикл = одно сообщение, дальше следующее по кругу.\n"
+        "Минимум: 1с между сообщениями, 10с между циклами."
+    )
+
+
 async def _timing(cb: CallbackQuery, cid: int) -> None:
     camp = await db.get_campaign(cid)
-    await cb.message.edit_text(
-        f"⏱ Интервалы\n\nСообщения: {camp['delay_min']}-{camp['delay_max']}с\n"
-        f"Цикл: {camp['cycle_min']}-{camp['cycle_max']}с\n\nМинимум: 10с / 120с.",
-        reply_markup=timing_kb(cid),
-    )
+    await cb.message.edit_text(_timing_text(camp), reply_markup=timing_kb(cid))
 
 
 @router.callback_query(F.data.startswith("t:menu:"))
@@ -902,6 +940,104 @@ async def t_rng(cb: CallbackQuery) -> None:
     await _timing(cb, int(cid))
     await cb.answer()
 
+
+@router.callback_query(F.data.startswith("t:in:"))
+async def t_input_start(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, kind = cb.data.split(":")
+    await state.set_state(Camp.timing)
+    await state.update_data(cid=int(cid), kind=kind, tid=None)
+    title = "между сообщениями" if kind == "delay" else "между циклами"
+    await cb.message.edit_text(
+        f"Интервал {title} в секундах.\n\n{HINT}",
+        reply_markup=K(inline_keyboard=[[B(text="⬅️ Отмена", callback_data=f"t:menu:{cid}")]]),
+    )
+    await cb.answer()
+
+
+@router.message(Camp.timing)
+async def t_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    cid, kind, tid = data.get("cid"), data.get("kind"), data.get("tid")
+    parsed = parse_interval(message.text or "")
+    if not parsed:
+        await message.answer(f"Не понял.\n\n{HINT}")
+        return
+
+    lo, hi = parsed
+    if kind == "delay":
+        await db.set_campaign(cid, delay_min=lo, delay_max=hi)
+    elif kind == "group":
+        lo, hi = max(10, lo), max(10, hi)
+        await db.set_target_cycle(tid, lo, hi)
+    else:
+        lo, hi = max(10, lo), max(10, hi)
+        await db.set_campaign(cid, cycle_min=lo, cycle_max=hi)
+    await state.clear()
+
+    if kind == "group":
+        await _group_timing(message, cid, tid)
+    else:
+        camp = await db.get_campaign(cid)
+        await message.answer(_timing_text(camp), reply_markup=timing_kb(cid))
+
+
+# ---------- цикл для отдельной группы ----------
+
+async def _group_timing(target, cid: int, tid: int) -> None:
+    camp = await db.get_campaign(cid)
+    own = target["cycle_min"] is not None
+    lo = target["cycle_min"] if own else camp["cycle_min"]
+    hi = target["cycle_max"] if own else camp["cycle_max"]
+    text = (
+        f"⏱ <b>{target['title']}</b>\n\n"
+        f"Интервал между циклами: {lo}-{hi}с ({'свой' if own else 'как в рассылке'})."
+    )
+    kb = group_timing_kb(cid, tid)
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb)
+    else:
+        await target.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("g:time:"))
+async def g_time(cb: CallbackQuery) -> None:
+    _, _, cid, tid = cb.data.split(":")
+    target = await db.fetchone("SELECT * FROM targets WHERE id=$1", int(tid))
+    if not target:
+        await cb.answer("Группа не найдена")
+        return
+    await _group_timing(cb, int(cid), int(tid))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("g:cyc:"))
+async def g_cyc(cb: CallbackQuery) -> None:
+    _, _, cid, tid, value = cb.data.split(":")
+    await db.set_target_cycle(int(tid), int(value), int(value))
+    target = await db.fetchone("SELECT * FROM targets WHERE id=$1", int(tid))
+    await _group_timing(cb, int(cid), int(tid))
+    await cb.answer(f"{value}с")
+
+
+@router.callback_query(F.data.startswith("g:cyc_reset:"))
+async def g_cyc_reset(cb: CallbackQuery) -> None:
+    _, _, cid, tid = cb.data.split(":")
+    await db.set_target_cycle(int(tid), None, None)
+    target = await db.fetchone("SELECT * FROM targets WHERE id=$1", int(tid))
+    await _group_timing(cb, int(cid), int(tid))
+    await cb.answer("Как в рассылке")
+
+
+@router.callback_query(F.data.startswith("g:cyc_in:"))
+async def g_cyc_in(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, cid, tid = cb.data.split(":")
+    await state.set_state(Camp.timing)
+    await state.update_data(cid=int(cid), kind="group", tid=int(tid))
+    await cb.message.edit_text(
+        f"Свой интервал между циклами для группы, в секундах.\n\n{HINT}",
+        reply_markup=K(inline_keyboard=[[B(text="⬅️ Отмена", callback_data=f"g:time:{cid}:{tid}")]]),
+    )
+    await cb.answer()
 
 # ================= админка =================
 
